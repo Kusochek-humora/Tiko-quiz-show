@@ -38,9 +38,10 @@ jobs:
           VITE_BASE: /${{ github.event.repository.name }}/
           # Адрес бэка хранится в секрете репозитория (Settings → Secrets and variables → Actions)
           VITE_API_URL: ${{ secrets.VITE_API_URL }}
-          # Пока на бэке нет квиз-API, сайт работает на демо-данных.
-          # Когда бэк задеплоят, создайте переменную репозитория VITE_USE_MOCK со значением false.
-          VITE_USE_MOCK: ${{ vars.VITE_USE_MOCK || 'true' }}
+          # Боевая сборка работает с настоящим бэком (демо-режим на моках выключен).
+          # Для показа без сервера переменную можно переопределить: Settings → Secrets and variables →
+          # Actions → Variables → VITE_USE_MOCK = true.
+          VITE_USE_MOCK: ${{ vars.VITE_USE_MOCK || 'false' }}
 
       - uses: actions/configure-pages@v5
 
