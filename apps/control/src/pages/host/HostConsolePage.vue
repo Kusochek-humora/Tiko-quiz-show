@@ -280,6 +280,10 @@ function logout() {
               <button v-if="inQuestion && status !== 'answer_revealed' && playing" class="btn btn-primary big" :disabled="store.busy" @click="store.command('reveal_answer')">
                 Показать ответ
               </button>
+              <!-- В фазе подготовки (ставки, кот, аукцион) вопрос можно пропустить, не доводя до показа -->
+              <button v-if="inQuestion && status !== 'answer_revealed' && !playing" class="btn big" :disabled="store.busy" @click="store.command('reveal_answer')">
+                Пропустить вопрос
+              </button>
               <button v-if="status === 'answer_revealed'" class="btn btn-primary big" :disabled="store.busy" @click="store.command('show_board')">Вернуться к полю</button>
               <button v-if="status !== 'idle' && status !== 'finished'" class="btn btn-danger" :disabled="store.busy" @click="finishGame">Завершить игру</button>
               <span v-if="status === 'finished'" class="muted">Игра завершена. Удалите сессию и начните новую.</span>
@@ -350,6 +354,9 @@ function logout() {
             </div>
 
             <KindControls :q="question" :players="players" />
+            <p v-if="question.phase === 'prepare'" class="muted hint">
+              Вопрос открыт, но зрителям ещё не показан. Чтобы вернуть его на поле, нажмите «← Назад» вверху (ещё раз, если делали ставки). «Пропустить вопрос» закроет его как сыгранный.
+            </p>
 
             <p class="q">{{ blocksText(question.content) }}</p>
 
