@@ -94,6 +94,22 @@ export function defaultSettings(kind: QuestionKind): QuestionSettings {
   }
 }
 
+/**
+ * Убирает из настроек пустые необязательные поля (null и пустые строки):
+ * бэк принимает их только со значением, например priceOverride: null вызовет 422.
+ */
+export function cleanSettings<T>(value: T): T {
+  if (Array.isArray(value)) return value.map((v) => cleanSettings(v)) as T
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .filter(([, v]) => v !== null && v !== undefined && v !== '')
+        .map(([k, v]) => [k, cleanSettings(v)]),
+    ) as T
+  }
+  return value
+}
+
 const filled = (v: unknown) => typeof v === 'string' && v.trim().length > 0
 const posInt = (v: unknown) => typeof v === 'number' && Number.isInteger(v) && v > 0
 

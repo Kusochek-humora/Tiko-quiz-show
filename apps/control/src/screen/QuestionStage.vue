@@ -1,99 +1,188 @@
 <script setup lang="ts">
-import type { RBlock, ScreenSnapshot } from '@/demo/engine'
+import { computed } from 'vue'
+import { absUrl, type QuizPlayer, type QuizQuestion, type QuizSnapshot } from '@/api'
+import { KIND_LABELS } from '@/kinds'
+import BlockList from './BlockList.vue'
 
-defineProps<{ q: NonNullable<ScreenSnapshot['question']>; revealed: boolean; countdown: number | null }>()
+// Сцена вопроса. Формы question.view для каждой механики описаны в QUIZ_API.md, раздел 6.
+// Экран только рисует то, что прислал бэк: скрытые ответы сюда просто не приходят.
+
+const props = defineProps<{ q: QuizQuestion; media: QuizSnapshot['media']; players: QuizPlayer[]; revealed: boolean; countdown: number | null }>()
 
 const LETTERS = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H']
 
-// Шаблон «___» превращаем в части: текст и пропуски
+const v = computed(() => props.q.view ?? {})
+const prepare = computed(() => props.q.phase === 'prepare')
+const kindLabel = computed(() => KIND_LABELS[props.q.kind])
+
+const url = (id?: string | null) => (id && props.media[id] ? absUrl(props.media[id].url) : null)
+const nameOf = (id?: string | null) => props.players.find((p) => p.id === id)?.name ?? ''
+
 const parts = (template: string) => String(template ?? '').split('___')
 
-const isMedia = (b: RBlock) => b.type !== 'text'
+// Супер-игра: финалисты и ставки (до ответа приходит только факт ставки)
+const finalInfo = computed(() => v.value.final as { finalists: string[]; stakes: Record<string, number | true> } | undefined)
+
+const bids = computed(() => [...(v.value.bids ?? [])].sort((a: { amount: number }, b: { amount: number }) => b.amount - a.amount))
+
+// «Расставить по порядку»: после ответа приходит correctOrder (id в верном порядке)
+const orderedItems = computed(() => {
+  const items: { id: string; text?: string; mediaId?: string }[] = v.value.items ?? []
+  const order: string[] | undefined = v.value.correctOrder
+  return order ? order.map((id) => items.find((i) => i.id === id)).filter((i): i is NonNullable<typeof i> => !!i) : items
+})
+
+// «Сопоставление»: после ответа приходят пары
+const matched = computed(() => {
+  const left: { id: string; text?: string }[] = v.value.left ?? []
+  const right: { id: string; text?: string }[] = v.value.right ?? []
+  const pairs: { leftId: string; rightId: string }[] | undefined = v.value.pairs
+  return pairs?.map((p) => ({ l: left.find((x) => x.id === p.leftId)?.text ?? '', r: right.find((x) => x.id === p.rightId)?.text ?? '' }))
+})
+
+// Открывающаяся картинка: чем больше шагов открыто, тем меньше размытие
+const blur = computed(() => {
+  const steps = Number(v.value.steps) || 1
+  const step = Number(v.value.step) || 0
+  return `${Math.max(0, 1 - step / steps) * 3}vw`
+})
 </script>
 
 <template>
   <div class="stage">
     <div class="top">
       <span class="price">{{ q.price }}</span>
-      <span v-if="q.kind !== 'standard'" class="kind">{{ q.kindLabel }}</span>
+      <span v-if="q.kind !== 'standard'" class="kind">{{ kindLabel }}</span>
+      <span class="theme">{{ q.themeTitle }}</span>
       <span v-if="countdown !== null" class="timer" :class="{ low: countdown <= 5 }">{{ countdown }}</span>
     </div>
 
     <div class="body">
-      <!-- Содержимое вопроса -->
-      <div class="content" :class="{ small: revealed }">
-        <template v-for="(b, i) in q.content" :key="i">
-          <p v-if="b.type === 'text'" class="text">{{ b.text }}</p>
-          <img v-else-if="b.type === 'image' && b.url" :src="b.url" class="media" alt="" />
-          <video v-else-if="b.type === 'video' && b.url" :src="b.url" class="media" autoplay muted loop playsinline />
-          <audio v-else-if="b.type === 'audio' && b.url" :src="b.url" autoplay />
-          <p v-if="isMedia(b) && b.type === 'audio'" class="audio">♪ Звучит аудио</p>
+      <!-- Фаза подготовки: заставка механики без содержимого вопроса -->
+      <div v-if="prepare" class="splash">
+        <h2>{{ finalInfo ? 'Супер-игра' : kindLabel }}</h2>
+        <p v-if="v.teaser" class="note">{{ v.teaser }}</p>
+        <p v-if="q.kind === 'cat_in_bag' && v.recipientId" class="note">Вопрос достаётся: <b>{{ nameOf(v.recipientId) }}</b></p>
+
+        <div v-if="q.kind === 'auction'" class="bids">
+          <p class="note">Стартовая ставка: {{ v.startBid }}</p>
+          <div v-for="b in bids" :key="b.participantId" class="bid"><span>{{ nameOf(b.participantId) }}</span><b>{{ b.amount }}</b></div>
+          <p v-if="v.closed && v.winnerId" class="note">Торги выиграл <b>{{ nameOf(v.winnerId) }}</b> за {{ v.winningBid }}</p>
+        </div>
+
+        <div v-if="q.kind === 'stake'" class="bids">
+          <p v-if="v.stake" class="note"><b>{{ nameOf(v.participantId) }}</b> ставит {{ v.stake }}</p>
+          <p v-else class="note">Ожидаем ставку</p>
+        </div>
+
+        <div v-if="finalInfo" class="chips">
+          <div v-for="id in finalInfo.finalists" :key="id" class="chip">
+            <span>{{ nameOf(id) }}</span>
+            <b>{{ finalInfo.stakes?.[id] === undefined ? 'думает…' : typeof finalInfo.stakes[id] === 'number' ? finalInfo.stakes[id] : 'ставка сделана' }}</b>
+          </div>
+        </div>
+      </div>
+
+      <template v-else>
+        <!-- Содержимое вопроса -->
+        <div v-if="q.content.length" class="content" :class="{ shrink: revealed }">
+          <BlockList :blocks="q.content" :media="media" :small="revealed" />
+        </div>
+
+        <!-- Механики -->
+        <div v-if="q.kind === 'options'" class="options">
+          <div v-for="(o, i) in v.options" :key="o.id" class="opt" :class="{ right: revealed && o.isCorrect === true, dim: revealed && o.isCorrect === false }">
+            <b>{{ LETTERS[Number(i)] }}</b>
+            <img v-if="url(o.mediaId)" :src="url(o.mediaId)!" class="thumb" alt="" />
+            <span>{{ o.text }}</span>
+          </div>
+        </div>
+
+        <template v-else-if="q.kind === 'true_false'">
+          <div class="options two">
+            <div class="opt" :class="{ right: v.correct === true, dim: v.correct === false }">Верю</div>
+            <div class="opt" :class="{ right: v.correct === false, dim: v.correct === true }">Не верю</div>
+          </div>
+          <p v-if="v.explanation" class="note">{{ v.explanation }}</p>
         </template>
-      </div>
 
-      <!-- Механики -->
-      <div v-if="q.kind === 'options'" class="options">
-        <div
-          v-for="(o, i) in q.view.options"
-          :key="o.id"
-          class="opt"
-          :class="{ right: revealed && o.isCorrect, dim: revealed && !o.isCorrect }"
-        >
-          <b>{{ LETTERS[Number(i)] }}</b>{{ o.text }}
+        <div v-else-if="q.kind === 'hints'" class="hints">
+          <div v-for="(h, i) in v.hints" :key="i" class="hint">
+            <b>{{ Number(i) + 1 }}</b>
+            <img v-if="url(h.mediaId)" :src="url(h.mediaId)!" class="thumb" alt="" />
+            <span>{{ h.text }}</span>
+          </div>
+          <div v-if="v.hintsShown < v.hintsTotal" class="hint closed">Подсказок осталось: {{ v.hintsTotal - v.hintsShown }}</div>
         </div>
-      </div>
 
-      <div v-else-if="q.kind === 'true_false'" class="options two">
-        <div class="opt" :class="{ right: revealed && q.view.correct === true, dim: revealed && q.view.correct !== true }">Верю</div>
-        <div class="opt" :class="{ right: revealed && q.view.correct === false, dim: revealed && q.view.correct !== false }">Не верю</div>
-      </div>
-      <p v-if="q.kind === 'true_false' && revealed && q.view.explanation" class="note">{{ q.view.explanation }}</p>
-
-      <div v-else-if="q.kind === 'hints'" class="hints">
-        <div v-for="(h, i) in q.view.opened" :key="i" class="hint"><b>{{ Number(i) + 1 }}</b>{{ h }}</div>
-        <div v-if="q.view.opened.length < q.view.total" class="hint closed">Подсказок осталось: {{ q.view.total - q.view.opened.length }}</div>
-      </div>
-
-      <div v-else-if="q.kind === 'ordering'" class="options">
-        <div v-for="(it, i) in q.view.items" :key="it.id" class="opt" :class="{ right: q.view.correctOrder }">
-          <b>{{ q.view.correctOrder ? Number(i) + 1 : '•' }}</b>{{ it.text }}
-        </div>
-      </div>
-
-      <div v-else-if="q.kind === 'matching'" class="match">
-        <div class="col">
-          <div v-for="(l, i) in q.view.left" :key="i" class="opt">{{ l }}</div>
-        </div>
-        <div class="col">
-          <div v-for="(r, i) in q.view.right" :key="i" class="opt" :class="{ right: q.view.matched }">{{ r }}</div>
-        </div>
-      </div>
-
-      <p v-else-if="q.kind === 'fill_blank'" class="text blank">
-        <template v-for="(p, i) in parts(q.view.template)" :key="i">
-          {{ p }}<span v-if="i < parts(q.view.template).length - 1" class="gap" :class="{ filled: q.view.blanks }">{{ q.view.blanks ? q.view.blanks[i] : '' }}</span>
+        <template v-else-if="q.kind === 'cat_in_bag'">
+          <p v-if="v.recipientId" class="note">Отвечает: <b>{{ nameOf(v.recipientId) }}</b>, вопрос за {{ v.price }}</p>
         </template>
-      </p>
 
-      <div v-else-if="q.kind === 'word_guess'" class="word">
-        <span class="mask">{{ [...q.view.mask].join(' ') }}</span>
-        <span v-if="q.view.hint" class="note">{{ q.view.hint }}</span>
-      </div>
-
-      <img v-else-if="q.kind === 'reveal_image' && q.view.url" :src="q.view.url" class="media" :class="{ blur: !revealed }" alt="" />
-
-      <p v-else-if="q.kind === 'blitz'" class="note">Блиц: {{ q.view.count }} вопросов по {{ q.view.points }}</p>
-      <p v-else-if="q.kind === 'cat_in_bag' && q.view.teaser" class="note">{{ q.view.teaser }}</p>
-
-      <!-- Ответ -->
-      <div v-if="revealed && q.answerContent" class="answer">
-        <span class="label">Ответ</span>
-        <template v-for="(b, i) in q.answerContent" :key="i">
-          <p v-if="b.type === 'text'" class="text ans">{{ b.text }}</p>
-          <img v-else-if="b.type === 'image' && b.url" :src="b.url" class="media" alt="" />
-          <video v-else-if="b.type === 'video' && b.url" :src="b.url" class="media" autoplay muted loop playsinline />
+        <template v-else-if="q.kind === 'auction'">
+          <p v-if="v.winnerId" class="note">Отвечает: <b>{{ nameOf(v.winnerId) }}</b>, ставка {{ v.winningBid }}</p>
         </template>
-      </div>
+
+        <template v-else-if="q.kind === 'stake'">
+          <p v-if="v.stake" class="note"><b>{{ nameOf(v.participantId) }}</b> поставил {{ v.stake }}</p>
+        </template>
+
+        <template v-else-if="q.kind === 'blitz'">
+          <p class="note">Вопрос {{ Number(v.index) + 1 }} из {{ v.total }}</p>
+          <div class="content"><BlockList :blocks="v.item?.content ?? []" :media="media" /></div>
+          <div v-if="v.answers" class="hints">
+            <div v-for="(a, i) in v.answers" :key="i" class="hint"><b>{{ Number(i) + 1 }}</b><span><BlockList :blocks="a" :media="media" small /></span></div>
+          </div>
+        </template>
+
+        <img v-else-if="q.kind === 'reveal_image' && url(v.mediaId)" :src="url(v.mediaId)!" class="pic" :style="{ filter: `blur(${blur})` }" alt="" />
+
+        <div v-else-if="q.kind === 'ordering'" class="options">
+          <div v-for="(it, i) in orderedItems" :key="it.id" class="opt" :class="{ right: !!v.correctOrder }">
+            <b>{{ v.correctOrder ? Number(i) + 1 : '•' }}</b>
+            <img v-if="url(it.mediaId)" :src="url(it.mediaId)!" class="thumb" alt="" />
+            <span>{{ it.text }}</span>
+          </div>
+        </div>
+
+        <template v-else-if="q.kind === 'matching'">
+          <div v-if="matched" class="options">
+            <div v-for="(m, i) in matched" :key="i" class="opt right"><span>{{ m.l }}</span><b>—</b><span>{{ m.r }}</span></div>
+          </div>
+          <div v-else class="match">
+            <div class="col"><div v-for="l in v.left" :key="l.id" class="opt">{{ l.text }}</div></div>
+            <div class="col"><div v-for="r in v.right" :key="r.id" class="opt">{{ r.text }}</div></div>
+          </div>
+        </template>
+
+        <p v-else-if="q.kind === 'fill_blank'" class="blank">
+          <template v-for="(p, i) in parts(v.template)" :key="i">
+            {{ p }}<span v-if="i < parts(v.template).length - 1" class="gap" :class="{ filled: !!v.blanks }">{{ v.blanks ? v.blanks[i] : '' }}</span>
+          </template>
+        </p>
+
+        <div v-else-if="q.kind === 'word_guess'" class="word">
+          <span class="mask">
+            <i v-for="(m, i) in v.mask" :key="i" :class="{ open: m.char }">{{ m.char ?? '' }}</i>
+          </span>
+          <span v-if="v.hint" class="note">{{ v.hint }}</span>
+          <span v-if="v.letters?.length" class="note">Названы: {{ v.letters.join(' ') }}</span>
+        </div>
+
+        <!-- Финал: ставки открываются вместе с ответом -->
+        <div v-if="finalInfo && revealed" class="chips">
+          <div v-for="id in finalInfo.finalists" :key="id" class="chip">
+            <span>{{ nameOf(id) }}</span>
+            <b>{{ typeof finalInfo.stakes?.[id] === 'number' ? finalInfo.stakes[id] : '—' }}</b>
+          </div>
+        </div>
+
+        <!-- Ответ -->
+        <div v-if="revealed && q.answerContent?.length" class="answer">
+          <span class="label">Ответ</span>
+          <BlockList :blocks="q.answerContent" :media="media" />
+        </div>
+      </template>
     </div>
   </div>
 </template>
@@ -132,6 +221,15 @@ const isMedia = (b: RBlock) => b.type !== 'text'
   text-transform: uppercase;
 }
 
+.theme {
+  overflow: hidden;
+  color: #9fb0ee;
+  font-size: 1.6vw;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
 .timer {
   margin-left: auto;
   color: #fff;
@@ -163,35 +261,8 @@ const isMedia = (b: RBlock) => b.type !== 'text'
   min-height: 0;
 }
 
-.content.small .text {
-  font-size: 2.4vw;
+.content.shrink {
   opacity: 0.6;
-}
-
-.text {
-  margin: 0;
-  color: #fff;
-  font-size: 3.4vw;
-  font-weight: 600;
-  line-height: 1.2;
-  text-align: center;
-}
-
-.media {
-  max-width: 100%;
-  max-height: 28vh;
-  border-radius: 0.8vw;
-  object-fit: contain;
-}
-
-.media.blur {
-  filter: blur(2.2vw);
-}
-
-.audio {
-  margin: 0;
-  color: #cfd8ff;
-  font-size: 2.4vw;
 }
 
 .options {
@@ -231,6 +302,21 @@ const isMedia = (b: RBlock) => b.type !== 'text'
   opacity: 0.35;
 }
 
+.thumb {
+  width: 5vw;
+  height: 5vw;
+  border-radius: 0.5vw;
+  object-fit: cover;
+}
+
+.pic {
+  max-width: 100%;
+  max-height: 34vh;
+  border-radius: 0.8vw;
+  object-fit: contain;
+  transition: filter 0.6s;
+}
+
 .match {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -253,6 +339,7 @@ const isMedia = (b: RBlock) => b.type !== 'text'
 
 .hint {
   display: flex;
+  align-items: center;
   gap: 1vw;
   padding: 0.8vw 1.4vw;
   border-radius: 0.8vw;
@@ -268,6 +355,15 @@ const isMedia = (b: RBlock) => b.type !== 'text'
 .hint.closed {
   color: #8d99bd;
   font-style: italic;
+}
+
+.blank {
+  margin: 0;
+  color: #fff;
+  font-size: 3.4vw;
+  font-weight: 600;
+  line-height: 1.4;
+  text-align: center;
 }
 
 .blank .gap {
@@ -286,10 +382,24 @@ const isMedia = (b: RBlock) => b.type !== 'text'
 }
 
 .mask {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 0.6vw;
+}
+
+.mask i {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 4.6vw;
+  height: 6vw;
+  border-bottom: 0.3vw solid #ffd84a;
   color: #fff;
-  font-size: 5vw;
+  font-size: 4vw;
+  font-style: normal;
   font-weight: 800;
-  letter-spacing: 0.3vw;
+  text-transform: uppercase;
 }
 
 .note {
@@ -297,6 +407,57 @@ const isMedia = (b: RBlock) => b.type !== 'text'
   color: #cfd8ff;
   font-size: 2vw;
   text-align: center;
+}
+
+.note b {
+  color: #ffd84a;
+}
+
+.splash {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1.2vw;
+}
+
+.splash h2 {
+  margin: 0;
+  color: #ffd84a;
+  font-size: 6vw;
+  font-weight: 900;
+  text-shadow: 0.25vw 0.25vw 0 rgba(0, 0, 0, 0.4);
+  text-transform: uppercase;
+}
+
+.bids {
+  display: flex;
+  flex-direction: column;
+  gap: 0.6vw;
+  min-width: 36vw;
+}
+
+.bid,
+.chip {
+  display: flex;
+  justify-content: space-between;
+  gap: 3vw;
+  padding: 0.6vw 1.6vw;
+  border-radius: 0.8vw;
+  background: rgba(8, 14, 40, 0.55);
+  color: #fff;
+  font-size: 2.2vw;
+}
+
+.bid b,
+.chip b {
+  color: #ffd84a;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 1vw;
 }
 
 .answer {
@@ -314,11 +475,6 @@ const isMedia = (b: RBlock) => b.type !== 'text'
   font-size: 1.4vw;
   letter-spacing: 0.2vw;
   text-transform: uppercase;
-}
-
-.ans {
-  color: #fff;
-  font-size: 3.6vw;
 }
 
 /* ---------- анимация ---------- */

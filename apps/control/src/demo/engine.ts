@@ -1,10 +1,22 @@
-import { KIND_LABELS } from '@/kinds'
-import type { BlockType, ContentBlock, Game, Media, Question, QuestionKind, Round, RoundType } from '@/api'
+import type {
+  ContentBlock,
+  Game,
+  Media,
+  Question,
+  QuizCell,
+  QuizSnapshot,
+  Round,
+  ScoreKind,
+  SessionRole,
+  SessionStatus,
+} from '@/api'
 
-// Демо-движок: повторяет автомат состояний из docs/backend.md на клиенте,
-// пока нет настоящего бэка. Чистые функции, без обращений к сети.
+// Демо-движок: повторяет автомат состояний из QUIZ_API.md на клиенте и отдаёт снимки
+// в том же формате, что и настоящий бэк. Нужен для работы без сервера и для проверки интерфейса.
+// Чистые функции, без обращений к сети. Механики с фазой prepare (кот, аукцион, ставка, финал)
+// здесь не реализованы: они работают только на настоящем бэке.
 
-export type Status = 'idle' | 'intro' | 'round_intro' | 'board' | 'question_shown' | 'timer_running' | 'answer_revealed' | 'finished'
+export type Status = SessionStatus
 
 export const STATUS_LABELS: Record<Status, string> = {
   idle: 'Ожидание',
@@ -24,8 +36,6 @@ export interface SessionPlayer {
   photoMediaId: string | null
   startScore: number
 }
-
-export type ScoreKind = 'correct' | 'wrong' | 'bonus' | 'penalty' | 'manual'
 
 export interface ScoreEvent {
   id: string
@@ -59,7 +69,7 @@ export interface SessionState {
 export type Command =
   | { type: 'start' }
   | { type: 'next_round' }
-  | { type: 'goto_round'; index: number }
+  | { type: 'goto_round'; roundId: string }
   | { type: 'show_board' }
   | { type: 'open_question'; questionId: string }
   | { type: 'start_timer' }
@@ -69,11 +79,18 @@ export type Command =
   | { type: 'finish' }
   | { type: 'back' }
 
-export class EngineError extends Error {}
+export class EngineError extends Error {
+  constructor(
+    message: string,
+    public code = 'INVALID_TRANSITION',
+  ) {
+    super(message)
+  }
+}
 
 const clone = <T>(v: T): T => JSON.parse(JSON.stringify(v))
-const fail = (message: string): never => {
-  throw new EngineError(message)
+const fail = (message: string, code?: string): never => {
+  throw new EngineError(message, code)
 }
 
 export const sortedRounds = (game: Game): Round[] => [...game.rounds].sort((a, b) => a.order - b.order)
@@ -132,7 +149,7 @@ const ALLOWED: Record<Exclude<Command['type'], 'back'>, Status[]> = {
 export function applyCommand(state: SessionState, cmd: Command, game: Game): SessionState {
   if (cmd.type === 'back') {
     const last = state.history.at(-1)
-    if (!last) return fail('Назад возвращаться некуда')
+    if (!last) return fail('Откатывать нечего', 'NOTHING_TO_UNDO')
     const prev = JSON.parse(last) as SessionState
     return { ...prev, history: state.history.slice(0, -1), version: state.version + 1 }
   }
@@ -151,7 +168,7 @@ export function applyCommand(state: SessionState, cmd: Command, game: Game): Ses
 
     case 'next_round': {
       const next = state.roundIndex + 1
-      if (next >= rounds.length) return fail('Раундов больше нет')
+      if (next >= rounds.length) return fail('Раундов больше нет', 'NO_MORE_ROUNDS')
       return commit(state, (n) => {
         n.roundIndex = next
         n.status = 'round_intro'
@@ -160,12 +177,13 @@ export function applyCommand(state: SessionState, cmd: Command, game: Game): Ses
       })
     }
 
-    // Переход к любому раунду, в том числе назад. Сыгранные вопросы остаются отмеченными.
+    // Переход к любому раунду по id, в том числе назад (как goto_round { roundId } на бэке)
     case 'goto_round': {
-      if (!Number.isInteger(cmd.index) || cmd.index < 0 || cmd.index >= rounds.length) return fail('Такого раунда нет')
-      if (cmd.index === state.roundIndex) return fail('Этот раунд уже открыт')
+      const index = rounds.findIndex((r) => r.id === cmd.roundId)
+      if (index < 0) return fail('Такого раунда нет', 'NOT_FOUND')
+      if (index === state.roundIndex) return fail('Этот раунд уже открыт')
       return commit(state, (n) => {
-        n.roundIndex = cmd.index
+        n.roundIndex = index
         n.status = 'round_intro'
         n.currentQuestionId = null
         n.timerEndsAt = null
@@ -185,7 +203,7 @@ export function applyCommand(state: SessionState, cmd: Command, game: Game): Ses
       const round = rounds[state.roundIndex]
       const q = round ? roundQuestions(round).find((x) => x.id === cmd.questionId) : undefined
       if (!q) return fail('Этого вопроса нет в текущем раунде')
-      if (state.played.includes(q.id)) return fail('Вопрос уже сыгран')
+      if (state.played.includes(q.id)) return fail('Вопрос уже сыгран', 'ALREADY_PLAYED')
       return commit(state, (n) => {
         n.status = 'question_shown'
         n.played.push(q.id)
@@ -197,7 +215,7 @@ export function applyCommand(state: SessionState, cmd: Command, game: Game): Ses
 
     case 'start_timer': {
       const q = state.currentQuestionId ? findQuestion(game, state.currentQuestionId) : null
-      if (!q?.timeLimitSec) return fail('У этого вопроса нет таймера')
+      if (!q?.timeLimitSec) return fail('У этого вопроса нет таймера', 'NO_TIMER')
       return commit(state, (n) => {
         n.status = 'timer_running'
         n.timerEndsAt = Date.now() + q.timeLimitSec! * 1000
@@ -249,8 +267,8 @@ export function addScore(
   state: SessionState,
   input: { participantId: string; kind: ScoreKind; delta: number; reason?: string; questionId?: string | null },
 ): SessionState {
-  if (!Number.isInteger(input.delta) || input.delta === 0) return fail('Сумма должна быть целым числом, не равным нулю')
-  if (!state.players.some((p) => p.id === input.participantId)) return fail('Игрока нет в сессии')
+  if (!Number.isInteger(input.delta) || input.delta === 0) return fail('Сумма должна быть целым числом, не равным нулю', 'VALIDATION_ERROR')
+  if (!state.players.some((p) => p.id === input.participantId)) return fail('Игрока нет в сессии', 'PARTICIPANT_NOT_FOUND')
   return commit(state, (n) => {
     n.events.push({
       id: crypto.randomUUID(),
@@ -266,59 +284,51 @@ export function addScore(
 }
 
 export function voidScore(state: SessionState, eventId: string): SessionState {
-  if (!state.events.some((e) => e.id === eventId)) return fail('Начисление не найдено')
+  const e = state.events.find((x) => x.id === eventId)
+  if (!e) return fail('Начисление не найдено', 'NOT_FOUND')
+  if (e.voided) return fail('Начисление уже отменено', 'ALREADY_VOIDED')
   return commit(state, (n) => {
-    const e = n.events.find((x) => x.id === eventId)!
-    e.voided = true
+    n.events.find((x) => x.id === eventId)!.voided = true
   })
 }
 
 /** Ручная правка итога: создаётся событие manual с разницей */
 export function setScore(state: SessionState, participantId: string, total: number, reason = ''): SessionState {
-  if (!Number.isInteger(total)) return fail('Счёт должен быть целым числом')
+  if (!Number.isInteger(total)) return fail('Счёт должен быть целым числом', 'VALIDATION_ERROR')
   const delta = total - playerScore(state, participantId)
-  if (delta === 0) return state
+  if (delta === 0) return fail('Счёт уже такой', 'NO_CHANGE')
   return addScore(state, { participantId, kind: 'manual', delta, reason: reason || 'Ручная правка счёта' })
 }
 
-export function setStartScore(state: SessionState, participantId: string, startScore: number): SessionState {
-  if (!Number.isInteger(startScore)) return fail('Стартовый балл должен быть целым числом')
+// ---------- игроки в сессии ----------
+
+export function addPlayer(state: SessionState, player: SessionPlayer): SessionState {
+  if (state.players.some((p) => p.id === player.id)) return fail('Игрок уже в сессии', 'ALREADY_IN_SESSION')
   return commit(state, (n) => {
-    const p = n.players.find((x) => x.id === participantId)
-    if (p) p.startScore = startScore
+    n.players.push(player)
   })
 }
 
-// ---------- снимок для экрана эфира ----------
-
-export interface RBlock {
-  type: BlockType
-  text?: string
-  url?: string
+export function removePlayer(state: SessionState, id: string): SessionState {
+  return commit(state, (n) => {
+    n.players = n.players.filter((p) => p.id !== id)
+    if (n.activeId === id) n.activeId = null
+  })
 }
 
-export interface ScreenSnapshot {
-  version: number
-  status: Status
-  timerEndsAt: number | null
-  serverTime: number
-  hostName: string
-  round: { title: string; description: string; index: number; total: number; type: RoundType } | null
-  board: { themes: { id: string; title: string; cells: { id: string; price: number; played: boolean }[] }[] } | null
-  question: {
-    id: string
-    kind: QuestionKind
-    kindLabel: string
-    price: number
-    timeLimitSec: number | null
-    content: RBlock[]
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    view: Record<string, any>
-    answerContent: RBlock[] | null
-  } | null
-  activeId: string | null
-  players: { id: string; name: string; color: string; photoUrl: string | null; score: number }[]
+export function patchPlayer(state: SessionState, id: string, patch: { startScore?: number; order?: number }): SessionState {
+  if (!state.players.some((p) => p.id === id)) return fail('Игрока нет в сессии', 'NOT_FOUND')
+  return commit(state, (n) => {
+    const idx = n.players.findIndex((p) => p.id === id)
+    if (patch.startScore !== undefined) n.players[idx].startScore = Math.trunc(patch.startScore)
+    if (patch.order !== undefined) {
+      const [p] = n.players.splice(idx, 1)
+      n.players.splice(Math.max(0, Math.min(n.players.length, patch.order)), 0, p)
+    }
+  })
 }
+
+// ---------- снимок состояния (формат QuizSnapshot) ----------
 
 function seeded(seed: string) {
   let h = 2166136261
@@ -345,98 +355,174 @@ function shuffled<T>(arr: T[], seed: string): T[] {
   return a
 }
 
-// Что показывать зрителям для конкретной механики. Верные ответы только после reveal.
-function buildView(q: Question, state: SessionState, revealed: boolean, urlOf: (id?: string | null) => string | null): Record<string, unknown> {
+// Что рисовать для конкретной механики. Ответы показываем пульту сразу, экрану только после reveal.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function buildView(q: Question, state: SessionState, showAnswer: boolean, role: SessionRole): Record<string, any> {
   const s = q.settings
   switch (q.kind) {
     case 'options':
       return {
-        variant: s.variant,
-        options: (s.options ?? []).map((o: { id: string; text: string; isCorrect: boolean }) => ({
+        variant: s.variant ?? 'choice',
+        multiple: !!s.multiple,
+        options: (s.options ?? []).map((o: { id: string; text?: string; mediaId?: string; isCorrect: boolean }) => ({
           id: o.id,
           text: o.text,
-          ...(revealed ? { isCorrect: o.isCorrect } : {}),
+          mediaId: o.mediaId,
+          ...(showAnswer ? { isCorrect: o.isCorrect } : {}),
         })),
       }
     case 'true_false':
-      return revealed ? { correct: s.correct, explanation: s.explanation } : {}
-    case 'hints':
-      return { opened: (s.hints ?? []).slice(0, state.hintsOpened).map((h: { text: string }) => h.text), total: (s.hints ?? []).length, penalty: s.penaltyPerHint }
+      return showAnswer ? { correct: s.correct, explanation: s.explanation } : {}
+    case 'hints': {
+      const hints: { text?: string; mediaId?: string }[] = s.hints ?? []
+      const base = { hintsShown: state.hintsOpened, hintsTotal: hints.length, penaltyPerHint: s.penaltyPerHint ?? 0 }
+      return role === 'host'
+        ? { ...base, hints: hints.map((h, i) => ({ ...h, shown: i < state.hintsOpened })) }
+        : { ...base, hints: hints.slice(0, state.hintsOpened) }
+    }
+    case 'cat_in_bag':
+      return { teaser: s.teaser, allowSelf: !!s.allowSelf, recipientId: null, price: s.priceOverride ?? q.price }
+    case 'auction':
+      return { startBid: s.startBid, step: s.step, bids: [], closed: false, winnerId: null, winningBid: null, minNextBid: s.startBid }
+    case 'stake':
+      return { stake: null, participantId: null, maxStake: s.maxStake ?? 'score' }
+    case 'blitz': {
+      const items: { content: ContentBlock[]; answerContent: ContentBlock[] }[] = s.items ?? []
+      return {
+        index: 0,
+        total: items.length,
+        perItemSec: s.perItemSec,
+        totalSec: s.totalSec,
+        pointsPerItem: s.pointsPerItem,
+        item: { content: items[0]?.content ?? [], ...(role === 'host' ? { answerContent: items[0]?.answerContent ?? [] } : {}) },
+        ...(showAnswer ? { answers: items.map((i) => i.answerContent) } : {}),
+      }
+    }
+    case 'reveal_image':
+      return { mediaId: s.mediaId, mode: s.mode, steps: s.steps, step: showAnswer ? s.steps : 0 }
     case 'ordering': {
-      const items: { id: string; text: string }[] = s.items ?? []
-      return { items: revealed ? items : shuffled(items, q.id), correctOrder: revealed }
+      const items: { id: string; text?: string; mediaId?: string }[] = s.items ?? []
+      return { items: shuffled(items, q.id), ...(showAnswer ? { correctOrder: items.map((i) => i.id) } : {}) }
     }
     case 'matching': {
-      const pairs: { left: { text: string }; right: { text: string } }[] = s.pairs ?? []
+      const pairs: { left: { text?: string; mediaId?: string }; right: { text?: string; mediaId?: string } }[] = s.pairs ?? []
+      const left = pairs.map((p, i) => ({ id: `l${i}`, ...p.left }))
+      const right = pairs.map((p, i) => ({ id: `r${i}`, ...p.right }))
       return {
-        left: pairs.map((p) => p.left.text),
-        right: revealed ? pairs.map((p) => p.right.text) : shuffled(pairs.map((p) => p.right.text), q.id),
-        matched: revealed,
+        left,
+        right: shuffled(right, q.id),
+        ...(showAnswer ? { pairs: pairs.map((_, i) => ({ leftId: `l${i}`, rightId: `r${i}` })) } : {}),
       }
     }
     case 'fill_blank':
-      return { template: s.template, blanks: revealed ? s.blanks : null }
+      return { template: s.template, blanksCount: (s.blanks ?? []).length, ...(showAnswer ? { blanks: s.blanks } : {}) }
     case 'word_guess': {
       const word = String(s.word ?? '')
-      return { mask: revealed ? word : word.replace(/./g, '•'), hint: s.hint }
+      return {
+        hint: s.hint,
+        letters: [],
+        mask: [...word].map((ch) => ({ char: showAnswer ? ch : null })),
+        ...(showAnswer ? { word } : {}),
+      }
     }
-    case 'blitz':
-      return { count: (s.items ?? []).length, points: s.pointsPerItem }
-    case 'reveal_image':
-      return { url: urlOf(s.mediaId), mode: s.mode }
-    case 'cat_in_bag':
-      return { teaser: s.teaser }
-    case 'auction':
-      return { startBid: s.startBid, step: s.step }
-    case 'stake':
-      return {}
     default:
       return {}
   }
 }
 
-export function toScreenSnapshot(state: SessionState, game: Game, media: Media[]): ScreenSnapshot {
+// Собираем в карту все файлы, на которые снимок ссылается по mediaId
+function collectMedia(value: unknown, byId: Map<string, Media>, out: QuizSnapshot['media']) {
+  if (Array.isArray(value)) {
+    value.forEach((v) => collectMedia(v, byId, out))
+  } else if (value && typeof value === 'object') {
+    for (const [k, v] of Object.entries(value)) {
+      if (k === 'mediaId' && typeof v === 'string') {
+        const m = byId.get(v)
+        if (m) out[v] = { type: m.type, url: m.url }
+      } else {
+        collectMedia(v, byId, out)
+      }
+    }
+  }
+}
+
+const VISIBLE_BOARD: Status[] = ['round_intro', 'board', 'question_shown', 'timer_running', 'answer_revealed']
+const QUESTION_STATES: Status[] = ['question_shown', 'timer_running', 'answer_revealed']
+
+export function toQuizSnapshot(state: SessionState, game: Game, mediaList: Media[], role: SessionRole): QuizSnapshot {
   const rounds = sortedRounds(game)
   const round = rounds[state.roundIndex] ?? null
-  const urlOf = (id?: string | null) => (id ? (media.find((m) => m.id === id)?.url ?? null) : null)
-  const resolve = (blocks: ContentBlock[]): RBlock[] => blocks.map((b) => ({ type: b.type, text: b.text, url: urlOf(b.mediaId) ?? undefined }))
+  const byId = new Map(mediaList.map((m) => [m.id, m]))
+  const host = role === 'host'
 
   const q = state.currentQuestionId ? findQuestion(game, state.currentQuestionId) : null
-  const showQuestion = !!q && (['question_shown', 'timer_running', 'answer_revealed'] as Status[]).includes(state.status)
+  const showQuestion = !!q && QUESTION_STATES.includes(state.status)
   const revealed = state.status === 'answer_revealed'
+  const showAnswer = host || revealed
 
-  return {
-    version: state.version,
-    status: state.status,
-    timerEndsAt: state.timerEndsAt,
-    serverTime: Date.now(),
-    hostName: state.hostName,
-    round: round ? { title: round.title, description: round.description, index: state.roundIndex, total: rounds.length, type: round.type } : null,
-    board: round
+  const board =
+    round && VISIBLE_BOARD.includes(state.status)
       ? {
           themes: [...round.themes]
             .sort((a, b) => a.order - b.order)
             .map((t) => ({
               id: t.id,
               title: t.title,
-              cells: [...t.questions].sort((a, b) => a.price - b.price).map((x) => ({ id: x.id, price: x.price, played: state.played.includes(x.id) })),
+              eliminated: false,
+              cells: [...t.questions]
+                .sort((a, b) => a.price - b.price)
+                .map(
+                  (x): QuizCell => ({
+                    questionId: x.id,
+                    price: x.price,
+                    played: state.played.includes(x.id),
+                    ...(host ? { question: { kind: x.kind, content: x.content, answerContent: x.answerContent, comment: x.comment } } : {}),
+                  }),
+                ),
             })),
         }
+      : null
+
+  const price = q ? effectivePrice(q, state) : 0
+  const question =
+    showQuestion && q
+      ? {
+          id: q.id,
+          kind: q.kind,
+          price,
+          timeLimitSec: q.timeLimitSec,
+          themeId: q.themeId,
+          themeTitle: round?.themes.find((t) => t.id === q.themeId)?.title ?? '',
+          phase: 'play' as const,
+          content: q.content,
+          view: buildView(q, state, showAnswer, role),
+          ...(showAnswer ? { answerContent: q.answerContent } : {}),
+          ...(host ? { pointsIfCorrect: price, pointsIfWrong: q.settings.noPenalty ? 0 : -price, comment: q.comment } : {}),
+        }
+      : null
+
+  const media: QuizSnapshot['media'] = {}
+  collectMedia(question, byId, media)
+  collectMedia(board, byId, media)
+
+  const photoUrl = (id: string | null) => (id ? (byId.get(id)?.url ?? null) : null)
+
+  return {
+    sessionId: state.id,
+    version: state.version,
+    status: state.status,
+    serverTime: new Date().toISOString(),
+    timerEndsAt: state.timerEndsAt ? new Date(state.timerEndsAt).toISOString() : null,
+    hostName: state.hostName || null,
+    round: round
+      ? { id: round.id, title: round.title, description: round.description, order: round.order, total: rounds.length, type: round.type, settings: round.settings }
       : null,
-    question:
-      showQuestion && q
-        ? {
-            id: q.id,
-            kind: q.kind,
-            kindLabel: KIND_LABELS[q.kind],
-            price: effectivePrice(q, state),
-            timeLimitSec: q.timeLimitSec,
-            content: resolve(q.content),
-            view: buildView(q, state, revealed, urlOf),
-            answerContent: revealed ? resolve(q.answerContent) : null,
-          }
-        : null,
-    activeId: state.activeId,
-    players: state.players.map((p) => ({ id: p.id, name: p.name, color: p.color, photoUrl: urlOf(p.photoMediaId), score: playerScore(state, p.id) })),
+    board,
+    question,
+    finalists: null,
+    activeParticipantId: state.activeId,
+    players: state.players.map((p, i) => ({ id: p.id, name: p.name, color: p.color, photo: photoUrl(p.photoMediaId), score: playerScore(state, p.id), order: i })),
+    media,
+    ...(host ? { canBack: state.history.length > 0, nextRoundAvailable: state.roundIndex + 1 < rounds.length } : {}),
   }
 }

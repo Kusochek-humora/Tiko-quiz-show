@@ -1,7 +1,8 @@
 <script setup lang="ts">
-import type { ScreenSnapshot } from '@/demo/engine'
+import { absUrl, type QuizPlayer } from '@/api'
 
-defineProps<{ players: ScreenSnapshot['players']; activeId: string | null }>()
+// finalists: в раунде final остальные игроки приглушаются
+defineProps<{ players: QuizPlayer[]; activeId: string | null; finalists?: string[] | null }>()
 
 const initials = (name: string) =>
   name
@@ -14,9 +15,15 @@ const initials = (name: string) =>
 
 <template>
   <div class="bar">
-    <div v-for="p in players" :key="p.id" class="card" :class="{ active: p.id === activeId }" :style="{ '--c': p.color }">
+    <div
+      v-for="p in players"
+      :key="p.id"
+      class="card"
+      :class="{ active: p.id === activeId, dim: finalists && finalists.length > 0 && !finalists.includes(p.id) }"
+      :style="{ '--c': p.color }"
+    >
       <div class="photo">
-        <img v-if="p.photoUrl" :src="p.photoUrl" :alt="p.name" />
+        <img v-if="p.photo" :src="absUrl(p.photo)" :alt="p.name" />
         <span v-else class="ini">{{ initials(p.name) }}</span>
       </div>
       <div class="info">
@@ -45,13 +52,17 @@ const initials = (name: string) =>
   border: 0.25vw solid color-mix(in srgb, var(--c) 45%, transparent);
   border-radius: 1.2vw;
   background: rgba(8, 14, 40, 0.78);
-  transition: border-color 0.2s, box-shadow 0.2s, transform 0.2s;
+  transition: border-color 0.2s, box-shadow 0.2s, transform 0.2s, opacity 0.3s;
 }
 
 .card.active {
   border-color: #39e08a;
   box-shadow: 0 0 2.4vw rgba(57, 224, 138, 0.55);
   transform: translateY(-0.6vw);
+}
+
+.card.dim {
+  opacity: 0.4;
 }
 
 .photo {

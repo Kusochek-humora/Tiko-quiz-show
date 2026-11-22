@@ -2,7 +2,7 @@
 import { reactive, ref, watch } from 'vue'
 import type { ContentBlock, Question, QuestionInput, QuestionKind, QuestionSettings } from '@/api'
 import { useGamesStore } from '@/stores/games'
-import { KIND_HINTS, KIND_LABELS, KIND_LIST, defaultSettings, textBlock, validateQuestion } from '@/kinds'
+import { KIND_HINTS, KIND_LABELS, KIND_LIST, cleanSettings, defaultSettings, textBlock, validateQuestion } from '@/kinds'
 import BaseModal from './BaseModal.vue'
 import ContentEditor from './ContentEditor.vue'
 import KindSettings from './KindSettings.vue'
@@ -55,7 +55,7 @@ async function run(fn: () => Promise<unknown>) {
 }
 
 function buildInput(): QuestionInput {
-  const settings: QuestionSettings = clone(form.settings)
+  const settings: QuestionSettings = cleanSettings(clone(form.settings))
   if (form.noPenalty) settings.noPenalty = true
   else delete settings.noPenalty
   return {

@@ -1,54 +1,71 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
-import { api, type Game, type Media } from '@/api'
-import { loadSession, subscribe } from '@/demo/bus'
-import { toScreenSnapshot, type SessionState } from '@/demo/engine'
+import { useRoute } from 'vue-router'
+import { isMock, type QuizSnapshot } from '@/api'
+import { openLive, type LiveState } from '@/sessions/live'
 import BoardView from './BoardView.vue'
 import PlayersBar from './PlayersBar.vue'
 import QuestionStage from './QuestionStage.vue'
 
 // Экран эфира. Только показывает состояние: ни кнопок, ни курсора.
-// В демо состояние приходит от пульта через localStorage и BroadcastChannel.
+// Адрес: #/screen/<id сессии>?token=<токен экрана>. В демо-режиме id и токен не нужны.
 
-const session = ref<SessionState | null>(loadSession())
-const game = ref<Game | null>(null)
-const media = ref<Media[]>([])
+const route = useRoute()
+
+const snap = ref<QuizSnapshot | null>(null)
+const live = ref<LiveState>('connecting')
+const closedReason = ref('')
 const now = ref(Date.now())
+// Разница между часами сервера и этого компьютера: нужна, чтобы таймер шёл точно
+const offset = ref(0)
 
-let unsubscribe: (() => void) | null = null
+let close: (() => void) | null = null
 let ticker: number | undefined
 
-async function loadStatic() {
-  const s = session.value
-  if (!s) {
-    game.value = null
-    return
-  }
-  if (game.value?.id !== s.gameId) game.value = await api.getGame(s.gameId)
-  media.value = await api.listMedia()
+// По WebSocket и REST снимки могут прийти вперемешку: показываем только не старее текущего
+function onSnapshot(s: QuizSnapshot) {
+  if (snap.value && snap.value.sessionId === s.sessionId && s.version < snap.value.version) return
+  snap.value = s
+  offset.value = Date.parse(s.serverTime) - Date.now()
 }
 
-let lastSessionId: string | null = null
-function onChange(s: SessionState | null) {
-  session.value = s
-  if (s?.id !== lastSessionId) {
-    lastSessionId = s?.id ?? null
-    game.value = null
-    loadStatic()
-  }
+// Первый клик по странице разрешает браузеру запускать видео и аудио со звуком
+function unlockMedia() {
+  document.querySelectorAll<HTMLMediaElement>('video, audio').forEach((el) => {
+    el.muted = false
+    void el.play().catch(() => {})
+  })
+}
+
+const sessionId = computed(() => String(route.params.sessionId ?? ''))
+const token = computed(() => String(route.query.token ?? ''))
+const missingLink = computed(() => !isMock && (!sessionId.value || !token.value))
+
+function connect() {
+  close?.()
+  closedReason.value = ''
+  if (missingLink.value) return
+  close = openLive(
+    { sessionId: sessionId.value, role: 'screen', token: token.value },
+    {
+      onSnapshot,
+      onState: (s) => (live.value = s),
+      onClosed: (reason) => (closedReason.value = reason),
+    },
+  )
 }
 
 onMounted(() => {
-  onChange(session.value)
-  unsubscribe = subscribe(onChange)
+  connect()
   ticker = window.setInterval(() => (now.value = Date.now()), 250)
+  window.addEventListener('click', unlockMedia)
 })
 onUnmounted(() => {
-  unsubscribe?.()
+  close?.()
   clearInterval(ticker)
+  window.removeEventListener('click', unlockMedia)
 })
-
-const snap = computed(() => (session.value && game.value ? toScreenSnapshot(session.value, game.value, media.value) : null))
+watch([sessionId, token], connect)
 
 // Откуда разворачивать вопрос: смотрим, где на поле стояла нажатая ячейка.
 // flush: 'pre' — колбэк срабатывает до обновления DOM, поле ещё на экране.
@@ -73,20 +90,28 @@ watch(
   { flush: 'pre' },
 )
 
+// Остаток времени с поправкой на часы сервера
 const countdown = computed(() => {
   const end = snap.value?.timerEndsAt
-  return end ? Math.max(0, Math.ceil((end - now.value) / 1000)) : null
+  return end ? Math.max(0, Math.ceil((Date.parse(end) - (now.value + offset.value)) / 1000)) : null
 })
 
-const leaders = computed(() => {
-  const list = [...(snap.value?.players ?? [])].sort((a, b) => b.score - a.score)
-  return list
-})
+const leaders = computed(() => [...(snap.value?.players ?? [])].sort((a, b) => b.score - a.score))
 </script>
 
 <template>
   <div class="screen">
-    <div v-if="!snap || snap.status === 'idle'" class="center">
+    <div v-if="missingLink" class="center">
+      <h1 class="logo">Своя игра</h1>
+      <p class="sub">Откройте ссылку экрана с пульта ведущего: в ней должны быть номер сессии и токен</p>
+    </div>
+
+    <div v-else-if="closedReason" class="center">
+      <h1 class="logo">Своя игра</h1>
+      <p class="sub">{{ closedReason }}</p>
+    </div>
+
+    <div v-else-if="!snap || snap.status === 'idle'" class="center">
       <h1 class="logo">Своя игра</h1>
       <p class="sub">{{ snap ? 'Скоро начнём' : 'Ожидание запуска игры' }}</p>
     </div>
@@ -98,8 +123,8 @@ const leaders = computed(() => {
           <p v-if="snap.hostName" class="sub">Ведущий: {{ snap.hostName }}</p>
         </div>
 
-        <div v-else-if="snap.status === 'round_intro' && snap.round" :key="snap.round.index" class="center">
-          <p class="sub">Раунд {{ snap.round.index + 1 }} из {{ snap.round.total }}</p>
+        <div v-else-if="snap.status === 'round_intro' && snap.round" :key="snap.round.order" class="center">
+          <p class="sub">Раунд {{ snap.round.order + 1 }} из {{ snap.round.total }}</p>
           <h1 class="logo">{{ snap.round.title }}</h1>
           <p v-if="snap.round.type === 'final'" class="sub gold">Супер-игра</p>
           <p v-if="snap.round.description" class="sub">{{ snap.round.description }}</p>
@@ -107,7 +132,16 @@ const leaders = computed(() => {
 
         <BoardView v-else-if="snap.status === 'board' && snap.board" :board="snap.board" />
 
-        <QuestionStage v-else-if="snap.question" :key="snap.question.id" :style="origin ?? undefined" :q="snap.question" :revealed="snap.status === 'answer_revealed'" :countdown="countdown" />
+        <QuestionStage
+          v-else-if="snap.question"
+          :key="snap.question.id"
+          :style="origin ?? undefined"
+          :q="snap.question"
+          :media="snap.media"
+          :players="snap.players"
+          :revealed="snap.status === 'answer_revealed'"
+          :countdown="countdown"
+        />
 
         <div v-else-if="snap.status === 'finished'" class="center">
           <p class="sub">Игра окончена</p>
@@ -117,14 +151,22 @@ const leaders = computed(() => {
       </main>
 
       <footer class="foot">
-        <PlayersBar :players="snap.players" :active-id="snap.status === 'finished' ? leaders[0]?.id ?? null : snap.activeId" />
+        <PlayersBar
+          :players="snap.players"
+          :active-id="snap.status === 'finished' ? (leaders[0]?.id ?? null) : snap.activeParticipantId"
+          :finalists="snap.finalists"
+        />
       </footer>
     </template>
+
+    <!-- Если связь пропала, показываем маленькую метку: картинка при этом остаётся на экране -->
+    <div v-if="live === 'lost' && !closedReason" class="lost">Нет связи, переподключаемся…</div>
   </div>
 </template>
 
 <style scoped>
 .screen {
+  position: relative;
   display: flex;
   flex-direction: column;
   width: 100vw;
@@ -177,6 +219,21 @@ const leaders = computed(() => {
   animation: fade-up 0.6s 0.35s both;
 }
 
+.sub.gold {
+  color: #ffd84a;
+  font-weight: 700;
+}
+
+.lost {
+  position: absolute;
+  top: 0.8vw;
+  right: 1vw;
+  padding: 0.3vw 1vw;
+  border-radius: 99vw;
+  background: rgba(229, 84, 79, 0.85);
+  font-size: 1.1vw;
+}
+
 /* Заставки: заголовок «влетает» с лёгким перелётом */
 .logo {
   animation: logo-in 0.9s cubic-bezier(0.2, 1.3, 0.3, 1) both;
@@ -195,10 +252,5 @@ const leaders = computed(() => {
     opacity: 0;
     transform: translateY(1.5vw);
   }
-}
-
-.sub.gold {
-  color: #ffd84a;
-  font-weight: 700;
 }
 </style>

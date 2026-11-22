@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import type { ScreenSnapshot } from '@/demo/engine'
+import type { QuizSnapshot } from '@/api'
 
-const props = defineProps<{ board: NonNullable<ScreenSnapshot['board']> }>()
+const props = defineProps<{ board: NonNullable<QuizSnapshot['board']> }>()
 
 const maxCells = computed(() => Math.max(1, ...props.board.themes.map((t) => t.cells.length)))
 const pad = (n: number) => Array.from({ length: maxCells.value - n })
@@ -10,17 +10,17 @@ const pad = (n: number) => Array.from({ length: maxCells.value - n })
 
 <template>
   <div class="board" data-board :style="{ '--n': maxCells }">
-    <div v-for="(t, ri) in board.themes" :key="t.id" class="row">
+    <div v-for="(t, ri) in board.themes" :key="t.id" class="row" :class="{ out: t.eliminated }">
       <div class="theme" :style="{ '--d': `${ri * 90}ms` }">{{ t.title }}</div>
       <div
         v-for="(c, ci) in t.cells"
-        :key="c.id"
+        :key="c.questionId"
         class="cell"
-        :class="{ played: c.played }"
-        :data-cell="c.id"
+        :class="{ played: c.played || t.eliminated }"
+        :data-cell="c.questionId"
         :style="{ '--d': `${ri * 90 + (ci + 1) * 60}ms` }"
       >
-        {{ c.played ? '' : c.price }}
+        {{ c.played || t.eliminated ? '' : c.price }}
       </div>
       <div v-for="(_, i) in pad(t.cells.length)" :key="`pad-${i}`" class="cell played"></div>
     </div>
@@ -45,6 +45,11 @@ const pad = (n: number) => Array.from({ length: maxCells.value - n })
   align-items: stretch; /* перебивает глобальный .row { align-items: center } */
   gap: 0.6vw;
   min-height: 0;
+}
+
+.row.out .theme {
+  opacity: 0.3;
+  text-decoration: line-through;
 }
 
 .theme {

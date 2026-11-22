@@ -26,7 +26,7 @@ export const router = createRouter({
       meta: { roles: ['admin', 'host'] },
     },
     // Экран эфира: без авторизации (в бою доступ по токену сессии)
-    { path: '/screen', name: 'screen', component: () => import('@/screen/ScreenPage.vue'), meta: { public: true } },
+    { path: '/screen/:sessionId?', name: 'screen', component: () => import('@/screen/ScreenPage.vue'), meta: { public: true } },
     { path: '/:pathMatch(.*)*', redirect: '/' },
   ],
 })
